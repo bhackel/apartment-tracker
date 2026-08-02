@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5">
+<title>Towers at Costa Verde — Availability Map</title>
+<link rel="stylesheet" href="/static/leaflet.css">
+<style>
+  :root { --bg:#0f172a; --panel:#111827; --ink:#e5e7eb; --muted:#9ca3af; --green:#16a34a; --accent:#38bdf8; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  #map { position:absolute; inset:0; background:#fff; }
+  #bar { position:absolute; z-index:1000; top:0; left:0; right:0; display:flex; gap:10px;
+    align-items:center; flex-wrap:wrap; padding:8px 12px; background:rgba(17,24,39,.92);
+    backdrop-filter:blur(6px); border-bottom:1px solid #1f2937; }
+  #bar b { color:#fff; } #bar .muted { color:var(--muted); }
+  button, select { background:#1f2937; color:var(--ink); border:1px solid #374151;
+    border-radius:8px; padding:6px 10px; font:inherit; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.on { background:var(--accent); color:#08131f; border-color:var(--accent); font-weight:600; }
+  .spacer { flex:1; }
+  .dd { position:relative; }
+  .dd-panel { position:absolute; top:110%; left:0; z-index:1100; display:none;
+    background:#111827; border:1px solid #374151; border-radius:8px; padding:6px; min-width:120px; }
+  .dd-panel.open { display:block; }
+  .dd-panel label { display:flex; align-items:center; gap:8px; padding:5px 8px; border-radius:6px; cursor:pointer; }
+  .dd-panel label:hover { background:#1f2937; }
+  .dd-panel input { accent-color:var(--accent); width:15px; height:15px; }
+  .leaflet-popup-content { margin:10px 12px; }
+  .pop h3 { margin:0 0 2px; font-size:15px; color:#0b3b5a; }
+  .pop .sub { color:#556; font-size:12px; margin-bottom:6px; }
+  .pop table { border-collapse:collapse; font-size:12.5px; }
+  .pop th,.pop td { padding:3px 7px; text-align:left; border-bottom:1px solid #e5e7eb; }
+  .pop th { color:#64748b; font-weight:600; }
+  .pop .net { font-weight:700; color:#0f766e; }
+  .pop .none { color:#b91c1c; font-style:italic; }
+  .badge { display:inline-block; min-width:16px; text-align:center; }
+  #legend { position:absolute; z-index:1000; bottom:10px; left:10px; background:rgba(17,24,39,.92);
+    border:1px solid #1f2937; border-radius:10px; padding:8px 10px; font-size:12px; color:var(--muted); }
+  #legend .row { display:flex; align-items:center; gap:6px; margin:2px 0; }
+  .dotk { width:12px; height:12px; border-radius:50%; display:inline-block; border:2px solid #fff; }
+  #toast { position:absolute; z-index:1200; bottom:14px; left:50%; transform:translateX(-50%);
+    background:#111827; border:1px solid #374151; padding:8px 14px; border-radius:10px;
+    opacity:0; transition:opacity .2s; pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <b>Towers at Costa Verde</b>
+  <span class="muted" id="meta">loading…</span>
+  <div class="spacer"></div>
+  <div class="dd" id="bedsDD">
+    <button id="bedsBtn">Beds: 1 ▾</button>
+    <div class="dd-panel" id="bedsPanel">
+      <label><input type="checkbox" value="1" checked> 1 bed</label>
+      <label><input type="checkbox" value="2"> 2 bed</label>
+      <label><input type="checkbox" value="3"> 3 bed</label>
+    </div>
+  </div>
+  <label class="muted">Min floor
+    <select id="floor"><option value="0">any</option></select>
+  </label>
+  <button id="refresh">↻ Live refresh</button>
+  <button id="edit">✎ Edit dots</button>
+  <button id="save" style="display:none">💾 Save layout</button>
+</div>
+<div id="map"></div>
+<div id="legend">
+  <div class="row"><span class="dotk" style="background:#16a34a"></span> available units (click for details)</div>
+  <div class="row" style="margin-top:4px">only stacks with availability are shown · scroll to zoom · drag to pan</div>
+</div>
+<div id="toast"></div>
+
+<script src="/static/leaflet.js"></script>
+<script>
+const IMG_W = 2142, IMG_H = 2772;
+const map = L.map('map', { crs: L.CRS.Simple, minZoom: -4, maxZoom: 3, zoomSnap: 0.25, attributionControl: false });
+const bounds = [[0,0],[IMG_H, IMG_W]];
+L.imageOverlay('/static/map.png', bounds).addTo(map);
+map.fitBounds(bounds);
+
+const toLatLng = (fx, fy) => [IMG_H * (1 - fy), IMG_W * fx];
+const fromLatLng = ll => ({ fx: ll.lng / IMG_W, fy: 1 - ll.lat / IMG_H });
+
+let dotsDoc = null;      // full dots.json
+let markers = {};        // key -> L.circleMarker  (only for stacks WITH availability)
+let avail = {};          // key -> block
+let editMode = false, minFloor = 0;
+let selectedBeds = new Set([1]);   // default: 1-bed only
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.style.opacity = 1;
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.opacity = 0, 1800);
+}
+
+function unitsFor(key) {
+  const blk = avail[key]; if (!blk) return [];
+  return blk.units.filter(u => parseInt(u.floor, 10) >= minFloor && selectedBeds.has(u.beds));
+}
+
+function styleFor(key) {
+  const n = unitsFor(key).length;
+  return {
+    radius: Math.min(9 + n, 14),
+    color: '#ffffff', weight: 2,
+    fillColor: '#16a34a', fillOpacity: 0.95,
+  };
+}
+const qualifies = key => unitsFor(key).length > 0;
+
+function popupHtml(key) {
+  const blk = avail[key];
+  const tower = blk ? blk.tower : '';
+  const fp = blk ? blk.floorplan : '';
+  const stack = key.split('-')[1];
+  const units = unitsFor(key);
+  let rows = units.map(u => `<tr>
+      <td>#${u.unit}<br><span style="color:#94a3b8">fl ${u.floor}</span></td>
+      <td class="net">$${u.net.toLocaleString()}</td>
+      <td>${u.price}</td>
+      <td>${u.concession}</td>
+      <td>${u.date_available}</td>
+    </tr>`).join('');
+  const body = units.length
+    ? `<table><tr><th>Unit</th><th>Net</th><th>List</th><th>Concession</th><th>Move-in</th></tr>${rows}</table>`
+    : `<div class="none">No current availability${minFloor>0?` at floor ≥ ${minFloor}`:''}</div>`;
+  return `<div class="pop"><h3>${fp}</h3>
+     <div class="sub">${tower} Tower · stack ${stack} · ${units.length} available</div>${body}</div>`;
+}
+
+function tipHtml(key) {
+  const blk = avail[key]; const n = unitsFor(key).length;
+  const fp = blk ? blk.floorplan : '';
+  const minNet = n ? Math.min(...unitsFor(key).map(u => u.net)) : null;
+  return `<b>${fp}</b> · stack ${key.split('-')[1]}<br>${n} avail · from $${minNet.toLocaleString()}`;
+}
+
+// Sync markers to exactly the set of stacks that currently have availability
+// (respecting the floor filter). Empty stacks get no marker at all, so there
+// are never invisible click targets or grey dots.
+function renderMarkers() {
+  const dotByKey = Object.fromEntries(dotsDoc.dots.map(d => [d.key, d]));
+  // drop markers that no longer qualify
+  Object.keys(markers).forEach(key => {
+    if (!qualifies(key)) { map.removeLayer(markers[key]); delete markers[key]; }
+  });
+  // add / update markers that qualify
+  dotsDoc.dots.forEach(d => {
+    if (!qualifies(d.key)) return;
+    let m = markers[d.key];
+    if (m) {
+      m.setStyle(styleFor(d.key));
+      m.setTooltipContent(tipHtml(d.key));
+      if (m.isPopupOpen()) m.setPopupContent(popupHtml(d.key));
+      return;
+    }
+    m = L.circleMarker(toLatLng(d.fx, d.fy), styleFor(d.key)).addTo(map);
+    m.bindTooltip(tipHtml(d.key), { direction: 'top', opacity: 0.95 });
+    m.bindPopup(popupHtml(d.key), { maxWidth: 380 });
+    m._key = d.key; m._dot = d;
+    m.on('dragend', e => {
+      const f = fromLatLng(e.target.getLatLng());
+      d.fx = +f.fx.toFixed(4); d.fy = +f.fy.toFixed(4);
+      toast(`${d.key} → ${d.fx}, ${d.fy}`);
+    });
+    markers[d.key] = m;
+    if (editMode) enableDrag(m);
+  });
+  updateMeta();
+}
+
+let metaInfo = { source: '', ts: '' };
+function updateMeta() {
+  const keys = Object.keys(avail);
+  let units = 0, stacks = 0;
+  keys.forEach(k => { const n = unitsFor(k).length; units += n; if (n) stacks++; });
+  document.getElementById('meta').innerHTML =
+    `<b>${units}</b> units in <b>${stacks}</b> stacks · <span class="muted">${metaInfo.source}: ${metaInfo.ts}</span>`;
+}
+
+async function loadAvailability(live) {
+  const meta = document.getElementById('meta');
+  meta.textContent = live ? 'fetching live…' : 'loading…';
+  const r = await fetch('/api/availability' + (live ? '?live=1' : ''));
+  const data = await r.json();
+  if (data.error) { meta.textContent = 'error: ' + data.error; return; }
+  avail = data.blocks;
+  metaInfo.source = data.source;
+  metaInfo.ts = data.source === 'live' ? 'LIVE ' + new Date().toLocaleTimeString()
+                                       : (data.timestamp || '').replace('T', ' ').slice(0, 16);
+  renderMarkers();   // calls updateMeta()
+}
+
+// ---- floor filter ----
+const floorSel = document.getElementById('floor');
+for (let f = 1; f <= 24; f++) { const o = document.createElement('option'); o.value = f; o.textContent = f + '+'; floorSel.appendChild(o); }
+floorSel.onchange = () => { minFloor = parseInt(floorSel.value, 10) || 0; renderMarkers(); };
+
+// ---- beds picker (dropdown w/ checkboxes) ----
+const bedsBtn = document.getElementById('bedsBtn');
+const bedsPanel = document.getElementById('bedsPanel');
+bedsBtn.onclick = e => { bedsPanel.classList.toggle('open'); e.stopPropagation(); };
+bedsPanel.addEventListener('click', e => e.stopPropagation());
+document.addEventListener('click', () => bedsPanel.classList.remove('open'));
+function updateBedsLabel() {
+  const a = [...selectedBeds].sort();
+  bedsBtn.textContent = 'Beds: ' + (a.length ? a.join(', ') : 'none') + ' ▾';
+}
+bedsPanel.querySelectorAll('input').forEach(cb => cb.onchange = () => {
+  selectedBeds = new Set([...bedsPanel.querySelectorAll('input:checked')].map(i => +i.value));
+  updateBedsLabel(); renderMarkers();
+});
+
+document.getElementById('refresh').onclick = () => loadAvailability(true);
+
+document.getElementById('edit').onclick = e => {
+  editMode = !editMode; e.target.classList.toggle('on', editMode);
+  document.getElementById('save').style.display = editMode ? '' : 'none';
+  Object.values(markers).forEach(m => {
+    // circleMarker isn't draggable by default; emulate via map drag of the marker
+    if (editMode) enableDrag(m); else disableDrag(m);
+  });
+  toast(editMode ? 'Edit mode: drag dots, then Save' : 'View mode');
+};
+
+// circleMarker drag emulation
+function enableDrag(m) {
+  m._drag = true; m.setStyle({ color: '#f59e0b', weight: 3 });
+  m.on('mousedown', startDrag);
+}
+function disableDrag(m) {
+  m._drag = false; m.off('mousedown', startDrag); m.setStyle(styleFor(m._key));
+}
+let dragging = null;
+function startDrag(e) { dragging = e.target; map.dragging.disable(); L.DomEvent.stop(e); }
+map.on('mousemove', e => { if (dragging) dragging.setLatLng(e.latlng); });
+map.on('mouseup', e => {
+  if (dragging) { dragging.fire('dragend', { target: dragging }); dragging = null; map.dragging.enable(); }
+});
+
+document.getElementById('save').onclick = async () => {
+  const r = await fetch('/api/dots', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(dotsDoc) });
+  const j = await r.json();
+  toast(j.ok ? 'Layout saved ✓' : 'Save failed: ' + (j.error || '?'));
+};
+
+(async function init() {
+  dotsDoc = await (await fetch('/api/dots')).json();
+  await loadAvailability(false);   // builds markers for available stacks only
+})();
+</script>
+</body>
+</html>

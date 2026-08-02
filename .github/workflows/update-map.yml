@@ -1,0 +1,45 @@
+name: Update availability map
+
+# Regenerates docs/availability.json (consumed by the GitHub Pages map) by
+# scraping the SecureCafe portal server-side. No secrets required: the scraper
+# skips ntfy when NTFY_URL is unset, which it is here.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 min (GitHub may delay scheduled runs)
+  workflow_dispatch: {}       # allow manual runs from the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-map
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install requests beautifulsoup4
+
+      - name: Generate availability.json
+        run: python mapserver/gen_availability.py --out docs/availability.json
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- docs/availability.json; then
+            git add docs/availability.json
+            git commit -m "chore: refresh availability.json [skip ci]"
+            git push
+          else
+            echo "no change"
+          fi
